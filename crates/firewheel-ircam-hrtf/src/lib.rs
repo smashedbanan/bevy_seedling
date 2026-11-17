@@ -161,11 +161,41 @@ pub struct FftSize {
     ///
     /// Defaults to 128.
     pub slice_len: usize,
+
+    /// Rounds [`slice_len`][FftSize::slice_len] to the nearest length whose FFT, the slice plus
+    /// the HRIR less one, is a power of two at the device's rate. The output is the same; the FFT
+    /// runs two to four times faster than at a length such as 48 kHz's 512 + 558 - 1 = 1069, a
+    /// prime.
+    ///
+    /// Defaults to `false`.
+    pub power_of_two_fft: bool,
 }
 
 impl Default for FftSize {
     fn default() -> Self {
-        Self { slice_len: 128 }
+        Self {
+            slice_len: 128,
+            power_of_two_fft: false,
+        }
+    }
+}
+
+impl FftSize {
+    // the slice for an HRIR of `hrir_len` taps
+    fn slice_for(&self, hrir_len: usize) -> usize {
+        if !self.power_of_two_fft {
+            return self.slice_len;
+        }
+        let history = hrir_len - 1;
+        let fft = self.slice_len + history;
+        let above = fft.next_power_of_two();
+        let below = above / 2;
+        let rounded = if below > history && fft - below < above - fft {
+            below
+        } else {
+            above
+        };
+        rounded - history
     }
 }
 
@@ -188,11 +218,23 @@ impl HrirSource {
             }
         }
     }
+
+    // The gain that keeps the HRTF as loud at `sample_rate` as at the subject's own rate: `hrtf`
+    // resamples each HRIR as a signal, so its taps, and the filter's gain, grow with the ratio.
+    // Call after a load of the same source succeeded, which read the header this reads.
+    fn rate_gain(&self, sample_rate: u32) -> f32 {
+        let bytes = match self {
+            HrirSource::Embedded(subject) => subject.as_ref(),
+            HrirSource::InMemory(subject) => subject.as_ref(),
+        };
+        let recorded = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        recorded as f32 / sample_rate as f32
+    }
 }
 
 // Each embedded subject's sphere at each rate, loaded once: loading and resampling one is nearly all
-// of a voice's build, and Firewheel builds every voice on the main thread. Only embedded subjects
-// are keyed; in-memory bytes load every time.
+// of a voice's build, and Firewheel builds the voices one after another, off the audio thread, while
+// the thread that asked waits. Only embedded subjects are keyed; in-memory bytes load every time.
 static SPHERES: Mutex<Vec<((Subject, u32), HrirSphere)>> = Mutex::new(Vec::new());
 
 // the loads `shared_sphere` made, as (subject, rate)
@@ -271,6 +313,16 @@ impl AudioNode for HrtfNode {
 // blocks. 50 is the top of the range probed; wider tilts and 44.1 kHz first pass 1.1 at 60.
 const CARRY_MIN_COS: f32 = 0.6428;
 
+// Added to every direction `hrtf` samples: 0.10.0 misses the sphere on exactly level rays, the
+// x = 0 meridian and the y = +-0.5 rings (15 of 360 level azimuths at 48 kHz), then keeps the last
+// HRTF, or the first point's (the front) on a voice's first use. Rays 1e-6 off them never missed.
+const NUDGE: Vec3 = Vec3::splat(1.0e-5);
+
+fn ray(direction: Vec3) -> hrtf::Vec3 {
+    let nudged = direction + NUDGE;
+    hrtf::Vec3::new(nudged.x, nudged.y, nudged.z)
+}
+
 struct FyroxHrtfProcessor {
     renderer: HrtfProcessor,
     offset: Vec3,
@@ -280,6 +332,10 @@ struct FyroxHrtfProcessor {
     prev_direction: Vec3,
     attenuation: DistanceAttenuation,
     attenuation_processor: DistanceAttenuatorStereoDsp,
+    // `HrirSource::rate_gain` at the stream's rate
+    gain: f32,
+    // `fft_size`'s slice for this stream's HRIR
+    slice_len: usize,
     muffle_cutoff_hz: f32,
     min_gain: f32,
     slice: Vec<f32>,
@@ -308,10 +364,11 @@ impl FyroxHrtfProcessor {
             .map_err(HrtfError)?;
 
         let hrir_len = sphere.len();
+        let slice_len = config.fft_size.slice_for(hrir_len);
 
         let offset = node.offset.normalize_or(Vec3::Y);
         let mut processor = FyroxHrtfProcessor {
-            renderer: HrtfProcessor::new(sphere, config.fft_size.slice_len),
+            renderer: HrtfProcessor::new(sphere, slice_len),
             offset,
             last_offset: offset,
             prev_direction: offset,
@@ -324,6 +381,8 @@ impl FyroxHrtfProcessor {
                 sample_rate,
                 node.coeff_update_factor,
             ),
+            gain: config.hrir_sphere.rate_gain(sample_rate.get()),
+            slice_len,
             muffle_cutoff_hz: node.muffle_cutoff_hz,
             min_gain: node.min_gain,
             slice: Vec::new(),
@@ -395,7 +454,7 @@ impl FyroxHrtfProcessor {
     }
 
     fn allocate(&mut self) {
-        let slice_len = self.fft_size.slice_len;
+        let slice_len = self.slice_len;
         let history_len = self.hrir_len - 1;
 
         self.slice = vec![0.0; slice_len];
@@ -432,20 +491,16 @@ impl FyroxHrtfProcessor {
         self.renderer.process_samples(HrtfContext {
             source: &self.slice,
             output: &mut self.rendered,
-            new_sample_vector: hrtf::Vec3::new(self.offset.x, self.offset.y, self.offset.z),
-            prev_sample_vector: hrtf::Vec3::new(
-                self.prev_direction.x,
-                self.prev_direction.y,
-                self.prev_direction.z,
-            ),
-            new_gain: 1.0,
-            prev_gain: 1.0,
+            new_sample_vector: ray(self.offset),
+            prev_sample_vector: ray(self.prev_direction),
+            new_gain: self.gain,
+            prev_gain: self.gain,
             history: &mut self.hrtf_history,
         });
         // `hrtf` fades across the whole slice, so a partial one gets only part of the way. The target
         // jumping wider than the crossover since the last render finishes at once; so does a carried
         // gap past 90 degrees, so the lerp never nears the zero vector and every turn settles.
-        self.prev_direction = if frames == self.fft_size.slice_len
+        self.prev_direction = if frames == self.slice_len
             || self.last_offset.dot(self.offset) < CARRY_MIN_COS
             || self.prev_direction.dot(self.offset) < 0.0
         {
@@ -454,9 +509,9 @@ impl FyroxHrtfProcessor {
             // shortcut: on a device whose blocks are shorter than a slice, a continuous turn of
             // about 20 degrees a block or more can click at every block boundary, more than snapping
             // would (half-slice blocks, a 1.5 kHz tone), and a jump of CARRY_MIN_COS (50 degrees)
-            // or more clicks once, if turns click on such a device, render whole slices through a
+            // or more clicks once. If turns click on such a device, render whole slices through a
             // FIFO at one slice of latency.
-            let reached = (frames - 1) as f32 / (self.fft_size.slice_len - 1) as f32;
+            let reached = (frames - 1) as f32 / (self.slice_len - 1) as f32;
             self.prev_direction
                 .lerp(self.offset, reached)
                 .normalize_or(self.offset)
@@ -526,7 +581,7 @@ impl AudioNodeProcessor for FyroxHrtfProcessor {
         // render each slice right away, zero-padding a partial one, so the
         // output is never delayed
         let frames = proc_info.frames;
-        let slice_len = self.fft_size.slice_len;
+        let slice_len = self.slice_len;
         for start in (0..frames).step_by(slice_len) {
             let end = (start + slice_len).min(frames);
 
@@ -564,7 +619,9 @@ impl AudioNodeProcessor for FyroxHrtfProcessor {
                 .expect("HRIR data should be in a valid format");
 
             self.hrir_len = sphere.len();
-            self.renderer = HrtfProcessor::new(sphere, self.fft_size.slice_len);
+            self.slice_len = self.fft_size.slice_for(self.hrir_len);
+            self.gain = self.sphere_source.rate_gain(sample_rate);
+            self.renderer = HrtfProcessor::new(sphere, self.slice_len);
             self.attenuation_processor
                 .update_sample_rate(stream_info.sample_rate);
 
@@ -578,6 +635,7 @@ impl AudioNodeProcessor for FyroxHrtfProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glam::Quat;
 
     fn rate48() -> NonZeroU32 {
         NonZeroU32::new(48_000).unwrap()
@@ -884,5 +942,166 @@ mod tests {
             .map(|b| (out[b * 64 + 1] - 2.0 * out[b * 64] + out[b * 64 - 1]).abs())
             .fold(0.0f32, f32::max);
         assert!(click < 0.05, "{click}");
+    }
+
+    // `input` through `p` in device blocks of `block`, sliced as `process` slices them
+    fn play(p: &mut FyroxHrtfProcessor, input: &[f32], block: usize) -> Vec<(f32, f32)> {
+        let mut out = Vec::new();
+        for chunk in input.chunks(block) {
+            let (mut l, mut r) = (vec![0.0; chunk.len()], vec![0.0; chunk.len()]);
+            for start in (0..chunk.len()).step_by(p.slice_len) {
+                let end = (start + p.slice_len).min(chunk.len());
+                p.slice[..end - start].copy_from_slice(&chunk[start..end]);
+                p.render(end - start, &mut l[start..end], &mut r[start..end]);
+            }
+            out.extend(l.into_iter().zip(r));
+        }
+        out
+    }
+
+    fn rounded(slice_len: usize) -> FftSize {
+        FftSize {
+            slice_len,
+            power_of_two_fft: true,
+        }
+    }
+
+    #[test]
+    fn a_power_of_two_fft_takes_the_nearest_slice_above_the_history() {
+        // The HRIR's taps at 44.1, 48 and 96 kHz: 1023 rounds up, 1069 down, 1626 up, as 1024 is
+        // shorter than the 1115 taps' history.
+        assert_eq!(rounded(512).slice_for(512), 513);
+        assert_eq!(rounded(512).slice_for(558), 467);
+        assert_eq!(rounded(512).slice_for(1115), 934);
+        assert_eq!(rounded(128).slice_for(558), 467);
+        assert_eq!(rounded(513).slice_for(512), 513);
+        assert_eq!(FftSize::default().slice_for(558), 128);
+    }
+
+    #[test]
+    fn a_power_of_two_fft_changes_no_output() {
+        // A held direction, in 1024-frame blocks: 512-sample slices against 467 at 48 kHz, every
+        // third slice partial.
+        let mut seed = 0x1234_5678_u32;
+        let input: Vec<f32> = (0..1024 * 16)
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                (seed as f32 / u32::MAX as f32) * 2.0 - 1.0
+            })
+            .collect();
+        let node = HrtfNode {
+            offset: Vec3::new(0.3, 0.2, -0.9),
+            ..Default::default()
+        };
+        let run = |fft_size: FftSize| {
+            let config = HrtfConfig {
+                fft_size,
+                ..Default::default()
+            };
+            let mut p = FyroxHrtfProcessor::new(&node, &config, rate48()).unwrap();
+            (p.slice_len, play(&mut p, &input, 1024))
+        };
+        let (exact_len, exact) = run(FftSize {
+            slice_len: 512,
+            power_of_two_fft: false,
+        });
+        let (pow2_len, pow2) = run(rounded(512));
+        assert_eq!((exact_len, pow2_len), (512, 1024 - (len_at(48_000) - 1)));
+        for (i, (a, b)) in exact.iter().zip(&pow2).enumerate() {
+            assert!(
+                (a.0 - b.0).abs() < 1e-5 && (a.1 - b.1).abs() < 1e-5,
+                "frame {i}: {a:?}, {b:?}"
+            );
+        }
+    }
+
+    fn len_at(rate: u32) -> usize {
+        HrirSource::from(Subject::Irc1040)
+            .shared_sphere(rate)
+            .unwrap()
+            .len()
+    }
+
+    #[test]
+    fn the_hrtf_is_as_loud_at_each_device_rate() {
+        // A 1 kHz tone ahead, each ear's level against the input's. Unscaled, 96 kHz is 6.8 dB
+        // louder than 44.1 (20 log10 of 96 / 44.1), as `hrtf` resamples the HRIR as a signal.
+        let level = |rate: u32| {
+            let node = HrtfNode {
+                offset: Vec3::new(0.0, 0.01, -1.0),
+                ..Default::default()
+            };
+            let config = HrtfConfig {
+                fft_size: rounded(512),
+                ..Default::default()
+            };
+            let mut p =
+                FyroxHrtfProcessor::new(&node, &config, NonZeroU32::new(rate).unwrap()).unwrap();
+            let tone: Vec<f32> = (0..rate as usize / 2)
+                .map(|i| (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / rate as f32).sin())
+                .collect();
+            let out = play(&mut p, &tone, 1024);
+            let settled = rate as usize / 10;
+            let power =
+                |samples: &mut dyn Iterator<Item = f32>| samples.map(|s| s * s).sum::<f32>();
+            let input = power(&mut tone[settled..].iter().copied());
+            let left = power(&mut out[settled..].iter().map(|s| s.0));
+            let right = power(&mut out[settled..].iter().map(|s| s.1));
+            [
+                10.0 * (left / input).log10(),
+                10.0 * (right / input).log10(),
+            ]
+        };
+        let base = level(44_100);
+        for rate in [48_000, 96_000] {
+            for (ear, (at, base)) in level(rate).iter().zip(base).enumerate() {
+                assert!(
+                    (at - base).abs() < 0.25,
+                    "{rate} Hz, ear {ear}: {at} dB, {base} dB"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exactly_level_and_median_rays_find_their_hrtf() {
+        // A voice's first slices at each direction against the same direction tilted 0.001 rad.
+        // Unnudged, 15 of the 360 level azimuths miss at 48 kHz (30 degrees among them) and play
+        // the front's HRTF.
+        let input: Vec<f32> = (0..1024).map(|i| (i as f32 * 0.13).sin()).collect();
+        let config = HrtfConfig {
+            fft_size: rounded(512),
+            ..Default::default()
+        };
+        let run = |offset: Vec3| {
+            let node = HrtfNode {
+                offset,
+                ..Default::default()
+            };
+            let mut p = FyroxHrtfProcessor::new(&node, &config, rate48()).unwrap();
+            play(&mut p, &input, 1024)
+        };
+        let ring = |deg: f32, y: f32| {
+            let (c, a) = ((1.0 - y * y).sqrt(), deg.to_radians());
+            Vec3::new(c * a.sin(), y, -c * a.cos())
+        };
+        let meridian = |deg: f32| {
+            let a = deg.to_radians();
+            Vec3::new(0.0, a.sin(), -a.cos())
+        };
+        let level = (0..360).map(|deg| ring(deg as f32, 0.0));
+        let rings = (0..360)
+            .step_by(15)
+            .flat_map(|deg| [ring(deg as f32, 0.5), ring(deg as f32, -0.5)]);
+        let median = (-45..=225).step_by(15).map(|deg| meridian(deg as f32));
+        for direction in level.chain(rings).chain(median) {
+            let tilted = Quat::from_rotation_x(0.001) * direction;
+            let diff = run(direction)
+                .iter()
+                .zip(&run(tilted))
+                .map(|(a, b)| (a.0 - b.0).abs().max((a.1 - b.1).abs()))
+                .fold(0.0f32, f32::max);
+            assert!(diff < 0.01, "{direction}: {diff}");
+        }
     }
 }

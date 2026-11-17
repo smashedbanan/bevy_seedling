@@ -4,6 +4,7 @@
 
 - Update `hrtf` to 0.10.0, whose HRIR resampling ratio is the right way round
 - Remove `FftSize::slice_count`: a change of direction now crossfades across one slice, `hrtf`'s own interpolation
+- Load an embedded subject's HRIR sphere once per sample rate and share it between nodes, so a node after the first builds in a tenth of the time
 
 # Fixes
 

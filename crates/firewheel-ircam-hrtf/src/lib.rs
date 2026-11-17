@@ -27,7 +27,11 @@ use firewheel::{
 };
 use glam::Vec3;
 use hrtf::{HrirSphere, HrtfContext, HrtfProcessor};
-use std::{io::Cursor, num::NonZeroU32};
+use std::{
+    io::Cursor,
+    num::NonZeroU32,
+    sync::{Mutex, PoisonError},
+};
 
 mod subjects;
 
@@ -186,6 +190,35 @@ impl HrirSource {
     }
 }
 
+// Each embedded subject's sphere at each rate, loaded once: loading and resampling one is nearly all
+// of a voice's build, and Firewheel builds every voice on the main thread. Only embedded subjects
+// are keyed; in-memory bytes load every time.
+static SPHERES: Mutex<Vec<((Subject, u32), HrirSphere)>> = Mutex::new(Vec::new());
+
+// the loads `shared_sphere` made, as (subject, rate)
+#[cfg(test)]
+static LOADS: Mutex<Vec<(Subject, u32)>> = Mutex::new(Vec::new());
+
+impl HrirSource {
+    // Takes a lock, so never on the audio thread: `FyroxHrtfProcessor::new` and `new_stream` both
+    // run off it, never in `process`. A failed load is not kept.
+    fn shared_sphere(&self, sample_rate: u32) -> Result<HrirSphere, hrtf::HrtfError> {
+        let HrirSource::Embedded(subject) = self else {
+            return self.get_sphere(sample_rate);
+        };
+        let key = (*subject, sample_rate);
+        let mut spheres = SPHERES.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((_, sphere)) = spheres.iter().find(|(cached, _)| *cached == key) {
+            return Ok(sphere.clone());
+        }
+        let sphere = self.get_sphere(sample_rate)?;
+        #[cfg(test)]
+        LOADS.lock().unwrap().push(key);
+        spheres.push((key, sphere.clone()));
+        Ok(sphere)
+    }
+}
+
 impl From<Subject> for HrirSource {
     fn from(value: Subject) -> Self {
         Self::Embedded(value)
@@ -271,7 +304,7 @@ impl FyroxHrtfProcessor {
     ) -> Result<Self, NodeError> {
         let sphere = config
             .hrir_sphere
-            .get_sphere(sample_rate.get())
+            .shared_sphere(sample_rate.get())
             .map_err(HrtfError)?;
 
         let hrir_len = sphere.len();
@@ -527,7 +560,7 @@ impl AudioNodeProcessor for FyroxHrtfProcessor {
 
             let sphere = self
                 .sphere_source
-                .get_sphere(sample_rate)
+                .shared_sphere(sample_rate)
                 .expect("HRIR data should be in a valid format");
 
             self.hrir_len = sphere.len();
@@ -563,6 +596,47 @@ mod tests {
         assert_eq!(len(44_100), 512);
         assert!((555..=559).contains(&len(48_000)), "{}", len(48_000));
         assert!((1_112..=1_117).contains(&len(96_000)), "{}", len(96_000));
+    }
+
+    fn loads_at(rate: u32) -> usize {
+        let subject = Subject::Irc1040;
+        let loads = LOADS.lock().unwrap();
+        loads
+            .iter()
+            .filter(|&&load| load == (subject, rate))
+            .count()
+    }
+
+    #[test]
+    fn voices_at_one_rate_share_one_sphere() {
+        // The lock is held across a load, so a rate is loaded once per process, whichever test
+        // builds a node at it first.
+        let rate = NonZeroU32::new(32_000).unwrap();
+        let build = || FyroxHrtfProcessor::new(&HrtfNode::default(), &HrtfConfig::default(), rate);
+        build().unwrap();
+        build().unwrap();
+        assert_eq!(loads_at(32_000), 1);
+    }
+
+    #[test]
+    fn each_rate_gets_a_sphere_of_its_own_length() {
+        // As `the_sphere_keeps_its_length_at_each_device_rate`, through the shared spheres, two
+        // nodes at each rate. Each rate is loaded once per process, even if another test got there
+        // first.
+        let len = |rate: u32| {
+            let rate = NonZeroU32::new(rate).unwrap();
+            let node = HrtfNode::default();
+            let p = FyroxHrtfProcessor::new(&node, &HrtfConfig::default(), rate).unwrap();
+            FyroxHrtfProcessor::new(&node, &HrtfConfig::default(), rate).unwrap();
+            p.hrir_len
+        };
+        assert_eq!(len(44_100), 512);
+        assert!((555..=559).contains(&len(48_000)), "{}", len(48_000));
+        assert!((1_112..=1_117).contains(&len(96_000)), "{}", len(96_000));
+        assert_eq!(
+            (loads_at(44_100), loads_at(48_000), loads_at(96_000)),
+            (1, 1, 1)
+        );
     }
 
     #[test]

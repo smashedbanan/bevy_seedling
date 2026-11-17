@@ -1,5 +1,10 @@
 # Unreleased
 
+# Changes
+
+- Update `hrtf` to 0.10.0, whose HRIR resampling ratio is the right way round
+- Remove `FftSize::slice_count`: a change of direction now crossfades across one slice, `hrtf`'s own interpolation
+
 # Fixes
 
 - Fix `HrtfNode` leaving part of its output unwritten when the block size isn't a multiple of the FFT size

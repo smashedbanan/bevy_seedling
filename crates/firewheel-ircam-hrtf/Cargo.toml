@@ -39,7 +39,7 @@ firewheel = { git = "https://github.com/smashedbanan/Firewheel", rev = "f029dfde
   "std",
 ] }
 glam = { version = "0.33", default-features = false, features = ["std"] }
-hrtf = "0.8.1"
+hrtf = "0.10.0"
 
 # Bevy dependencies
 bevy_ecs = { version = "0.20.0", default-features = false, features = [

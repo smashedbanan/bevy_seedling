@@ -163,9 +163,9 @@ pub struct FftSize {
     pub slice_len: usize,
 
     /// Rounds [`slice_len`][FftSize::slice_len] to the nearest length whose FFT, the slice plus
-    /// the HRIR less one, is a power of two at the device's rate. The output is the same; the FFT
-    /// runs two to four times faster than at a length such as 48 kHz's 512 + 558 - 1 = 1069, a
-    /// prime.
+    /// the HRIR less one, is a power of two at the device's rate, but never below half of
+    /// `slice_len`. The output is the same; the FFT runs two to four times faster than at a length
+    /// such as 48 kHz's 512 + 558 - 1 = 1069, a prime.
     ///
     /// Defaults to `false`.
     pub power_of_two_fft: bool,
@@ -190,7 +190,9 @@ impl FftSize {
         let fft = self.slice_len + history;
         let above = fft.next_power_of_two();
         let below = above / 2;
-        let rounded = if below > history && fft - below < above - fft {
+        // Down only while the slice keeps half its length: under an HRIR a power of two long, as
+        // at 88.2 kHz, the power below is the history plus one, a slice of 1.
+        let rounded = if below >= history + self.slice_len / 2 && fft - below < above - fft {
             below
         } else {
             above
@@ -313,10 +315,11 @@ impl AudioNode for HrtfNode {
 // blocks. 50 is the top of the range probed; wider tilts and 44.1 kHz first pass 1.1 at 60.
 const CARRY_MIN_COS: f32 = 0.6428;
 
-// Added to every direction `hrtf` samples: 0.10.0 misses the sphere on exactly level rays, the
-// x = 0 meridian and the y = +-0.5 rings (15 of 360 level azimuths at 48 kHz), then keeps the last
-// HRTF, or the first point's (the front) on a voice's first use. Rays 1e-6 off them never missed.
-const NUDGE: Vec3 = Vec3::splat(1.0e-5);
+// Added to every direction `hrtf` samples: 0.10.0 misses the sphere on some rays exactly in its
+// planes of symmetry, such as y = 0 (15 of 360 level azimuths at 48 kHz), x = 0 and x = -z, then
+// keeps the last HRTF, or the first point's (the front) on a voice's first use. Rays 1e-6 off them
+// never missed. The parts differ: a nudge along (1, 1, 1) stays in x = z, where a ray still missed.
+const NUDGE: Vec3 = Vec3::new(1.0e-5, 1.3e-5, 0.7e-5);
 
 fn ray(direction: Vec3) -> hrtf::Vec3 {
     let nudged = direction + NUDGE;
@@ -976,6 +979,11 @@ mod tests {
         assert_eq!(rounded(128).slice_for(558), 467);
         assert_eq!(rounded(513).slice_for(512), 513);
         assert_eq!(FftSize::default().slice_for(558), 128);
+        // An HRIR a power of two long, at 88.2 and 176.4 kHz, or 44.1 under a short slice, rounds
+        // up: down would leave a slice of 1.
+        assert_eq!(rounded(512).slice_for(1024), 1025);
+        assert_eq!(rounded(512).slice_for(2048), 2049);
+        assert_eq!(rounded(128).slice_for(512), 513);
     }
 
     #[test]
@@ -1064,10 +1072,11 @@ mod tests {
     }
 
     #[test]
-    fn exactly_level_and_median_rays_find_their_hrtf() {
+    fn exactly_level_rays_find_their_hrtf() {
         // A voice's first slices at each direction against the same direction tilted 0.001 rad.
         // Unnudged, 15 of the 360 level azimuths miss at 48 kHz (30 degrees among them) and play
-        // the front's HRTF.
+        // the front's HRTF. Rays in the other planes are
+        // `rays_in_the_planes_of_symmetry_find_the_sphere`'s.
         let input: Vec<f32> = (0..1024).map(|i| (i as f32 * 0.13).sin()).collect();
         let config = HrtfConfig {
             fft_size: rounded(512),
@@ -1085,16 +1094,7 @@ mod tests {
             let (c, a) = ((1.0 - y * y).sqrt(), deg.to_radians());
             Vec3::new(c * a.sin(), y, -c * a.cos())
         };
-        let meridian = |deg: f32| {
-            let a = deg.to_radians();
-            Vec3::new(0.0, a.sin(), -a.cos())
-        };
-        let level = (0..360).map(|deg| ring(deg as f32, 0.0));
-        let rings = (0..360)
-            .step_by(15)
-            .flat_map(|deg| [ring(deg as f32, 0.5), ring(deg as f32, -0.5)]);
-        let median = (-45..=225).step_by(15).map(|deg| meridian(deg as f32));
-        for direction in level.chain(rings).chain(median) {
+        for direction in (0..360).map(|deg| ring(deg as f32, 0.0)) {
             let tilted = Quat::from_rotation_x(0.001) * direction;
             let diff = run(direction)
                 .iter()
@@ -1102,6 +1102,60 @@ mod tests {
                 .map(|(a, b)| (a.0 - b.0).abs().max((a.1 - b.1).abs()))
                 .fold(0.0f32, f32::max);
             assert!(diff < 0.01, "{direction}: {diff}");
+        }
+    }
+
+    #[test]
+    fn rays_in_the_planes_of_symmetry_find_the_sphere() {
+        // Every 0.05 degrees round each plane and ring, and 19 rays between each pair of points
+        // within about 18 degrees. Unnudged, 214 level rays miss, 79 in x = 0 and 362 in x = -z;
+        // nudged along (1, 1, 1), one in x = z and 13 between points still do.
+        let p = FyroxHrtfProcessor::new(&HrtfNode::default(), &HrtfConfig::default(), rate48())
+            .unwrap();
+        let sphere = HrirSource::from(Subject::Irc1040)
+            .shared_sphere(48_000)
+            .unwrap();
+        let points: Vec<Vec3> = sphere
+            .points()
+            .iter()
+            .map(|point| Vec3::new(point.pos.x, point.pos.y, point.pos.z).normalize())
+            .collect();
+        let misses = |direction: Vec3| {
+            let (mut l, mut r) = (Vec::new(), Vec::new());
+            p.renderer
+                .hrtf_sphere()
+                .sample_bilinear(&mut l, &mut r, ray(direction.normalize()));
+            l.is_empty()
+        };
+        use std::f32::consts::FRAC_1_SQRT_2 as H;
+        // y = 0, x = 0, z = 0, x = z, x = -z, x = y, x = -y, y = z, y = -z, y = 0.5 and y = -0.5
+        let planes: [fn(f32, f32) -> Vec3; 11] = [
+            |c, s| Vec3::new(s, 0.0, -c),
+            |c, s| Vec3::new(0.0, s, -c),
+            |c, s| Vec3::new(c, s, 0.0),
+            |c, s| Vec3::new(c * H, s, c * H),
+            |c, s| Vec3::new(c * H, s, -c * H),
+            |c, s| Vec3::new(c * H, c * H, s),
+            |c, s| Vec3::new(c * H, -c * H, s),
+            |c, s| Vec3::new(s, c * H, c * H),
+            |c, s| Vec3::new(s, c * H, -c * H),
+            |c, s| Vec3::new(0.8660254 * s, 0.5, -0.8660254 * c),
+            |c, s| Vec3::new(0.8660254 * s, -0.5, -0.8660254 * c),
+        ];
+        for at in planes {
+            for i in 0..7200 {
+                let (s, c) = (i as f32 * 0.05).to_radians().sin_cos();
+                let direction = at(c, s);
+                assert!(!misses(direction), "{direction}");
+            }
+        }
+        for (i, &a) in points.iter().enumerate() {
+            for &b in points[i + 1..].iter().filter(|&&b| a.dot(b) >= 0.95) {
+                for k in 1..20 {
+                    let direction = a.lerp(b, k as f32 / 20.0);
+                    assert!(!misses(direction), "{a} to {b}: {k} of 20");
+                }
+            }
         }
     }
 }
